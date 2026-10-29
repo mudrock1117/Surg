@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -54,13 +56,81 @@ def _resolve_mesh(path_text: str, repo_root: Path) -> Path:
     return path
 
 
+def _read_stl_vertices(path: Path) -> list[tuple[float, float, float]]:
+    """Read vertices from binary or ASCII STL without third-party packages."""
+    raw = path.read_bytes()
+    # Binary STL: 80-byte header + uint32 triangle count + 50 bytes/triangle.
+    if len(raw) >= 84:
+        triangle_count = struct.unpack_from("<I", raw, 80)[0]
+        if 84 + triangle_count * 50 == len(raw):
+            vertices: list[tuple[float, float, float]] = []
+            offset = 84
+            for _ in range(triangle_count):
+                # Normal (3 floats), then three vertices (9 floats), then attribute bytes.
+                values = struct.unpack_from("<12f", raw, offset)
+                vertices.extend((values[3:6], values[6:9], values[9:12]))
+                offset += 50
+            if vertices:
+                return vertices
+    # ASCII STL fallback.
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+    except Exception as exc:
+        raise ValueError(f"Cannot decode STL: {path}") from exc
+    vertices = [
+        (float(x), float(y), float(z))
+        for x, y, z in re.findall(
+            r"\bvertex\s+([-+\d.eE]+)\s+([-+\d.eE]+)\s+([-+\d.eE]+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ]
+    if not vertices:
+        raise ValueError(f"No triangle vertices found; unsupported or empty STL: {path}")
+    return vertices
+
+
+def _mesh_bounds(
+    mesh_path: Path,
+    position: list[float],
+    euler_deg: list[float],
+    scale: float,
+) -> tuple[list[float], list[float], list[float], list[float], int]:
+    """Return local dimensions, transformed world bounds, and vertex count."""
+    vertices = _read_stl_vertices(mesh_path)
+    local_min = [min(v[i] for v in vertices) for i in range(3)]
+    local_max = [max(v[i] for v in vertices) for i in range(3)]
+    local_dims = [local_max[i] - local_min[i] for i in range(3)]
+
+    roll, pitch, yaw = [math.radians(v) for v in euler_deg]
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    # Rotation matrix matching roll-pitch-yaw (XYZ Euler) convention.
+    rotation = [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+    transformed = []
+    for vertex in vertices:
+        scaled = [component * scale for component in vertex]
+        transformed.append([
+            sum(rotation[i][j] * scaled[j] for j in range(3)) + position[i]
+            for i in range(3)
+        ])
+    world_min = [min(v[i] for v in transformed) for i in range(3)]
+    world_max = [max(v[i] for v in transformed) for i in range(3)]
+    return local_dims, world_min, world_max, local_min, len(vertices)
+
+
 def _add_mesh(
     label: str,
     mesh_path: Path,
     object_config: dict[str, Any],
     scale: float,
     rgba: list[float],
-) -> int:
+) -> tuple[int, list[float], list[float]]:
     position = _vec3(object_config.get("position_m", [0, 0, 0]), f"{label}.position_m")
     euler_deg = _vec3(object_config.get("euler_deg", [0, 0, 0]), f"{label}.euler_deg")
     euler_rad = [math.radians(v) for v in euler_deg]
@@ -77,39 +147,45 @@ def _add_mesh(
     body_id = p.createMultiBody(
         baseMass=0,
         baseVisualShapeIndex=visual_id,
+        # Intentionally visual-only: no collision shape is created at this stage.
         baseCollisionShapeIndex=-1,
         basePosition=position,
         baseOrientation=orientation,
     )
-    aabb_min, aabb_max = p.getAABB(body_id)
-    dimensions = [aabb_max[i] - aabb_min[i] for i in range(3)]
+
+    local_dims, world_min, world_max, local_min, vertex_count = _mesh_bounds(
+        mesh_path, position, euler_deg, scale
+    )
+    world_dims = [world_max[i] - world_min[i] for i in range(3)]
     print(f"\n[loaded] {label}")
-    print(f"  file       : {mesh_path}")
-    print(f"  body ID    : {body_id}")
-    print(f"  position m : {[round(v, 6) for v in position]}")
-    print(f"  Euler deg  : {euler_deg}")
-    print(f"  scale      : {scale}")
-    print(f"  AABB min m : {[round(v, 6) for v in aabb_min]}")
-    print(f"  AABB max m : {[round(v, 6) for v in aabb_max]}")
-    print(f"  size m     : {[round(v, 6) for v in dimensions]}")
-    print(f"  size mm*   : {[round(v * 1000, 3) for v in dimensions]} (*world size converted to mm)")
-    return body_id
+    print(f"  file               : {mesh_path}")
+    print(f"  body ID            : {body_id}")
+    print(f"  STL vertices       : {vertex_count}")
+    print(f"  STL local min      : {[round(v, 6) for v in local_min]}")
+    print(f"  STL size (raw units): {[round(v, 6) for v in local_dims]}")
+    print(f"  position m         : {[round(v, 6) for v in position]}")
+    print(f"  Euler deg          : {euler_deg}")
+    print(f"  scale              : {scale}")
+    print(f"  world bounds min m : {[round(v, 6) for v in world_min]}")
+    print(f"  world bounds max m : {[round(v, 6) for v in world_max]}")
+    print(f"  world size m       : {[round(v, 6) for v in world_dims]}")
+    print(f"  world size mm      : {[round(v * 1000, 3) for v in world_dims]}")
+    return body_id, world_min, world_max
 
 
-def _fit_camera(body_ids: list[int], fallback_distance: float = 0.12) -> None:
-    if not body_ids:
+def _fit_camera(bounds: list[tuple[list[float], list[float]]], fallback_distance: float = 0.12) -> None:
+    if not bounds:
         return
-    bounds = [p.getAABB(body_id) for body_id in body_ids]
     lower = [min(box[0][i] for box in bounds) for i in range(3)]
     upper = [max(box[1][i] for box in bounds) for i in range(3)]
     center = [(lower[i] + upper[i]) / 2.0 for i in range(3)]
     extent = max(upper[i] - lower[i] for i in range(3))
     distance = max(extent * 2.8, 0.01) if extent > 0 else fallback_distance
     print("\n[scene]")
-    print(f"  combined AABB min m: {[round(v, 6) for v in lower]}")
-    print(f"  combined AABB max m: {[round(v, 6) for v in upper]}")
-    print(f"  camera target m    : {[round(v, 6) for v in center]}")
-    print(f"  auto camera distance: {distance:.4f} m")
+    print(f"  combined bounds min m: {[round(v, 6) for v in lower]}")
+    print(f"  combined bounds max m: {[round(v, 6) for v in upper]}")
+    print(f"  camera target m      : {[round(v, 6) for v in center]}")
+    print(f"  auto camera distance : {distance:.4f} m")
     p.resetDebugVisualizerCamera(
         cameraDistance=distance,
         cameraYaw=45,
@@ -151,20 +227,10 @@ def main() -> None:
         "eye_part_2": _resolve_mesh(args.part2, repo_root),
         "membrane": _resolve_mesh(args.membrane, repo_root),
     }
-    show_to_name = {
-        "part1": "eye_part_1",
-        "part2": "eye_part_2",
-        "membrane": "membrane",
-    }
-    if args.show == "all":
-        meshes = all_meshes
-    else:
-        name = show_to_name[args.show]
-        meshes = {name: all_meshes[name]}
+    show_to_name = {"part1": "eye_part_1", "part2": "eye_part_2", "membrane": "membrane"}
+    meshes = all_meshes if args.show == "all" else {show_to_name[args.show]: all_meshes[show_to_name[args.show]]}
 
-    config_path = args.config
-    if config_path is not None:
-        config_path = config_path.expanduser().resolve()
+    config_path = args.config.expanduser().resolve() if args.config is not None else None
     config = _load_config(config_path)
     objects = config["objects"]
     missing = [name for name in all_meshes if name not in objects]
@@ -174,6 +240,7 @@ def main() -> None:
     print("\nNOTE: STL does not reliably contain SolidWorks assembly-instance transforms.")
     print("The example/default transforms are all zero; use a measured config for alignment.")
     print("This script loads visual meshes only; it does not simulate collisions or peeling.")
+    print("Bounds are computed directly from STL vertices; PyBullet AABB is not used because visual-only bodies have no collision shape.")
     print(f"Display mode: {args.show}; mesh scale: {args.scale}\n")
 
     client = p.connect(p.GUI, options=f"--width={args.width} --height={args.height}")
@@ -191,16 +258,16 @@ def main() -> None:
             "eye_part_2": [0.25, 0.55, 0.95, 0.65],
             "membrane": [1.0, 0.22, 0.18, 1.0],
         }
-        body_ids = []
+        bounds = []
         for name, mesh_path in meshes.items():
-            body_ids.append(_add_mesh(name, mesh_path, objects[name], args.scale, colors[name]))
+            _, world_min, world_max = _add_mesh(name, mesh_path, objects[name], args.scale, colors[name])
+            bounds.append((world_min, world_max))
 
-        # World axes: red=X, green=Y, blue=Z.
         axis_len = 0.05
         p.addUserDebugLine([0, 0, 0], [axis_len, 0, 0], [1, 0, 0], 2)
         p.addUserDebugLine([0, 0, 0], [0, axis_len, 0], [0, 1, 0], 2)
         p.addUserDebugLine([0, 0, 0], [0, 0, axis_len], [0, 0, 1], 2)
-        _fit_camera(body_ids)
+        _fit_camera(bounds)
 
         print("\nPyBullet preview running. Close the GUI window to exit.")
         while p.isConnected():
