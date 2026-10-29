@@ -1,0 +1,18 @@
+{
+  "units": "mm",
+  "comment": "Replace these placeholder transforms with the transforms measured from the SolidWorks assembly. position_m is in PyBullet meters; euler_deg is XYZ Euler angles in degrees.",
+  "objects": {
+    "eye_part_1": {
+      "position_m": [0.0, 0.0, 0.0],
+      "euler_deg": [0.0, 0.0, 0.0]
+    },
+    "eye_part_2": {
+      "position_m": [0.0, 0.0, 0.0],
+      "euler_deg": [0.0, 0.0, 0.0]
+    },
+    "membrane": {
+      "position_m": [0.0, 0.0, 0.0],
+      "euler_deg": [0.0, 0.0, 0.0]
+    }
+  }
+}
