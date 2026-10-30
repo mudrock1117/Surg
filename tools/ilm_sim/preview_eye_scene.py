@@ -272,8 +272,8 @@ def main() -> None:
     if missing:
         parser.error(f"Config is missing object entries: {', '.join(missing)}")
 
-    print("\nNOTE: STL does not reliably contain SolidWorks assembly-instance transforms.")
-    print("The example/default transforms are all zero; use a measured config for alignment.")
+    print("\nNOTE: STL geometry is transformed by the supplied SolidWorks assembly-instance config.")
+    print("The two eye entries may intentionally reference identical local STL geometry.")
     print("This script loads visual meshes only; it does not simulate collisions or peeling.")
     print("Bounds are computed directly from STL vertices; PyBullet AABB is not used because visual-only bodies have no collision shape.")
     print(f"Display mode: {args.show}; mesh scale: {args.scale}\n")
