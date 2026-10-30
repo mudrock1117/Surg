@@ -15,7 +15,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import pybullet as p
+from scipy.spatial.transform import Rotation
 
 
 def _vec3(value: Any, label: str) -> list[float]:
@@ -95,6 +98,7 @@ def _mesh_bounds(
     position: list[float],
     euler_deg: list[float],
     scale: float,
+    rotation_matrix: list[list[float]] | None = None,
 ) -> tuple[list[float], list[float], list[float], list[float], int]:
     """Return local dimensions, transformed world bounds, and vertex count."""
     vertices = _read_stl_vertices(mesh_path)
@@ -102,16 +106,19 @@ def _mesh_bounds(
     local_max = [max(v[i] for v in vertices) for i in range(3)]
     local_dims = [local_max[i] - local_min[i] for i in range(3)]
 
-    roll, pitch, yaw = [math.radians(v) for v in euler_deg]
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    # Rotation matrix matching roll-pitch-yaw (XYZ Euler) convention.
-    rotation = [
-        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-        [-sp, cp * sr, cp * cr],
-    ]
+    if rotation_matrix is not None:
+        R = np.asarray(rotation_matrix, dtype=float)
+        rotation = R.tolist()
+    else:
+        roll, pitch, yaw = [math.radians(v) for v in euler_deg]
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        rotation = [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ]
     transformed = []
     for vertex in vertices:
         scaled = [component * scale for component in vertex]
@@ -133,8 +140,18 @@ def _add_mesh(
 ) -> tuple[int, list[float], list[float]]:
     position = _vec3(object_config.get("position_m", [0, 0, 0]), f"{label}.position_m")
     euler_deg = _vec3(object_config.get("euler_deg", [0, 0, 0]), f"{label}.euler_deg")
-    euler_rad = [math.radians(v) for v in euler_deg]
-    orientation = p.getQuaternionFromEuler(euler_rad)
+
+    rotation_matrix = object_config.get("rotation_matrix")
+    if rotation_matrix is not None:
+        R = np.asarray(rotation_matrix, dtype=np.float64)
+        assert np.allclose(R.T @ R, np.eye(3), atol=1e-5), f"{label}: rotation_matrix not orthogonal"
+        assert np.isclose(np.linalg.det(R), 1.0, atol=1e-5), f"{label}: rotation_matrix det != 1"
+        quaternion = Rotation.from_matrix(R).as_quat().tolist()
+        orient_source = "rotation_matrix -> quaternion"
+    else:
+        euler_rad = [math.radians(v) for v in euler_deg]
+        quaternion = p.getQuaternionFromEuler(euler_rad)
+        orient_source = "euler_deg -> quaternion (fallback)"
 
     visual_id = p.createVisualShape(
         shapeType=p.GEOM_MESH,
@@ -147,14 +164,13 @@ def _add_mesh(
     body_id = p.createMultiBody(
         baseMass=0,
         baseVisualShapeIndex=visual_id,
-        # Intentionally visual-only: no collision shape is created at this stage.
         baseCollisionShapeIndex=-1,
         basePosition=position,
-        baseOrientation=orientation,
+        baseOrientation=quaternion,
     )
 
     local_dims, world_min, world_max, local_min, vertex_count = _mesh_bounds(
-        mesh_path, position, euler_deg, scale
+        mesh_path, position, euler_deg, scale, rotation_matrix=rotation_matrix
     )
     world_dims = [world_max[i] - world_min[i] for i in range(3)]
     print(f"\n[loaded] {label}")
@@ -164,7 +180,8 @@ def _add_mesh(
     print(f"  STL local min      : {[round(v, 6) for v in local_min]}")
     print(f"  STL size (raw units): {[round(v, 6) for v in local_dims]}")
     print(f"  position m         : {[round(v, 6) for v in position]}")
-    print(f"  Euler deg          : {euler_deg}")
+    print(f"  orientation src    : {orient_source}")
+    print(f"  quaternion xyzw    : {[round(v, 6) for v in quaternion]}")
     print(f"  scale              : {scale}")
     print(f"  world bounds min m : {[round(v, 6) for v in world_min]}")
     print(f"  world bounds max m : {[round(v, 6) for v in world_max]}")
@@ -173,25 +190,29 @@ def _add_mesh(
     return body_id, world_min, world_max
 
 
-def _fit_camera(bounds: list[tuple[list[float], list[float]]], fallback_distance: float = 0.12) -> None:
+def _fit_camera(bounds: list[tuple[list[float], list[float]]], fallback_distance: float = 0.12) -> tuple[float, float, float, list[float]]:
     if not bounds:
-        return
+        return fallback_distance, 45.0, -25.0, [0.0, 0.0, 0.0]
     lower = [min(box[0][i] for box in bounds) for i in range(3)]
     upper = [max(box[1][i] for box in bounds) for i in range(3)]
     center = [(lower[i] + upper[i]) / 2.0 for i in range(3)]
     extent = max(upper[i] - lower[i] for i in range(3))
     distance = max(extent * 2.8, 0.01) if extent > 0 else fallback_distance
+    yaw = 45.0
+    pitch = -25.0
     print("\n[scene]")
     print(f"  combined bounds min m: {[round(v, 6) for v in lower]}")
     print(f"  combined bounds max m: {[round(v, 6) for v in upper]}")
     print(f"  camera target m      : {[round(v, 6) for v in center]}")
     print(f"  auto camera distance : {distance:.4f} m")
-    p.resetDebugVisualizerCamera(
-        cameraDistance=distance,
-        cameraYaw=45,
-        cameraPitch=-25,
-        cameraTargetPosition=center,
-    )
+    if p.isConnected():
+        p.resetDebugVisualizerCamera(
+            cameraDistance=distance,
+            cameraYaw=yaw,
+            cameraPitch=pitch,
+            cameraTargetPosition=center,
+        )
+    return distance, yaw, pitch, center
 
 
 def main() -> None:
@@ -214,6 +235,20 @@ def main() -> None:
     )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=900)
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Use DIRECT mode for offline rendering (no X11 required)",
+    )
+    parser.add_argument(
+        "--screenshot",
+        type=Path,
+        help="Save rendered PNG path (only with --headless)",
+    )
+    parser.add_argument("--yaw", type=float, default=None,
+                        help="Camera yaw deg (default 45)")
+    parser.add_argument("--pitch", type=float, default=None,
+                        help="Camera pitch deg (default -25)")
     args = parser.parse_args()
 
     if args.scale <= 0 or not math.isfinite(args.scale):
@@ -243,15 +278,17 @@ def main() -> None:
     print("Bounds are computed directly from STL vertices; PyBullet AABB is not used because visual-only bodies have no collision shape.")
     print(f"Display mode: {args.show}; mesh scale: {args.scale}\n")
 
-    client = p.connect(p.GUI, options=f"--width={args.width} --height={args.height}")
+    if args.headless:
+        print("Headless mode: DIRECT + ER_BULLET_HARDWARE_OPENGL")
+        client = p.connect(p.DIRECT)
+    else:
+        client = p.connect(p.GUI, options=f"--width={args.width} --height={args.height}")
     if client < 0:
-        raise RuntimeError("Could not connect to PyBullet GUI")
+        raise RuntimeError("Could not connect to PyBullet")
 
     try:
         p.resetSimulation()
         p.setGravity(0, 0, 0)
-        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 1)
-        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)
 
         colors = {
             "eye_part_1": [0.86, 0.86, 0.82, 1.0],
@@ -267,12 +304,53 @@ def main() -> None:
         p.addUserDebugLine([0, 0, 0], [axis_len, 0, 0], [1, 0, 0], 2)
         p.addUserDebugLine([0, 0, 0], [0, axis_len, 0], [0, 1, 0], 2)
         p.addUserDebugLine([0, 0, 0], [0, 0, axis_len], [0, 0, 1], 2)
-        _fit_camera(bounds)
 
-        print("\nPyBullet preview running. Close the GUI window to exit.")
-        while p.isConnected():
+        camera_distance, camera_yaw, camera_pitch, camera_target = _fit_camera(bounds)
+
+        if args.yaw is not None:
+            camera_yaw = args.yaw
+        if args.pitch is not None:
+            camera_pitch = args.pitch
+        print(f"\n[camera] yaw={camera_yaw}  pitch={camera_pitch}  distance={camera_distance:.4f} m")
+
+        if args.headless:
+            view_matrix = p.computeViewMatrixFromYawPitchRoll(
+                cameraTargetPosition=camera_target,
+                distance=camera_distance,
+                yaw=camera_yaw,
+                pitch=camera_pitch,
+                roll=0,
+                upAxisIndex=2,
+            )
+            proj_matrix = p.computeProjectionMatrixFOV(
+                fov=60,
+                aspect=args.width / args.height,
+                nearVal=0.001,
+                farVal=10.0,
+            )
             p.stepSimulation()
-            time.sleep(1.0 / 60.0)
+            _, _, rgb, _, _ = p.getCameraImage(
+                width=args.width,
+                height=args.height,
+                viewMatrix=view_matrix,
+                projectionMatrix=proj_matrix,
+                renderer=p.ER_BULLET_HARDWARE_OPENGL,
+            )
+            img = np.array(rgb, dtype=np.uint8).reshape((args.height, args.width, 4))
+            bgr = cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2BGR)
+
+            screenshot_path = args.screenshot
+            if screenshot_path is None:
+                screenshot_path = Path(f"screenshots/{args.show}.png")
+            screenshot_path = screenshot_path.resolve()
+            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(screenshot_path), bgr)
+            print(f"\n[headless] screenshot saved: {screenshot_path}  ({args.width}x{args.height})")
+        else:
+            print("\nPyBullet preview running. Close the GUI window to exit.")
+            while p.isConnected():
+                p.stepSimulation()
+                time.sleep(1.0 / 60.0)
     finally:
         if p.isConnected():
             p.disconnect()
