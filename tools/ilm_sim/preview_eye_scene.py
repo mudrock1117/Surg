@@ -131,6 +131,36 @@ def _mesh_bounds(
     return local_dims, world_min, world_max, local_min, len(vertices)
 
 
+def _rotation_from_config(label: str, object_config: dict[str, Any]) -> tuple[np.ndarray, list[float], str]:
+    """Validate rotation data and return a proper matrix and Bullet quaternion."""
+    euler_deg = _vec3(object_config.get("euler_deg", [0, 0, 0]), f"{label}.euler_deg")
+    euler_matrix = Rotation.from_euler("xyz", euler_deg, degrees=True).as_matrix()
+    matrix_value = object_config.get("rotation_matrix")
+    if matrix_value is None:
+        R = euler_matrix
+        source = "euler_deg"
+    else:
+        R = np.asarray(matrix_value, dtype=np.float64)
+        if R.shape != (3, 3) or not np.all(np.isfinite(R)):
+            raise ValueError(f"{label}: rotation_matrix must be a finite 3x3 matrix")
+        orth_error = float(np.linalg.norm(R.T @ R - np.eye(3), ord="fro"))
+        determinant = float(np.linalg.det(R))
+        if orth_error > 1e-5 or abs(determinant - 1.0) > 1e-5:
+            raise ValueError(
+                f"{label}: invalid rotation_matrix (orthogonality error={orth_error:.3e}, "
+                f"det={determinant:.9f}); expected a proper rotation"
+            )
+        mismatch = float(np.max(np.abs(R - euler_matrix)))
+        if "euler_deg" in object_config and mismatch > 1e-5:
+            raise ValueError(
+                f"{label}: rotation_matrix and euler_deg disagree "
+                f"(max abs error={mismatch:.3e}, XYZ degrees)"
+            )
+        source = "rotation_matrix (validated against euler_deg)"
+    quaternion = Rotation.from_matrix(R).as_quat().tolist()
+    return R, quaternion, source
+
+
 def _add_mesh(
     label: str,
     mesh_path: Path,
@@ -140,18 +170,12 @@ def _add_mesh(
 ) -> tuple[int, list[float], list[float]]:
     position = _vec3(object_config.get("position_m", [0, 0, 0]), f"{label}.position_m")
     euler_deg = _vec3(object_config.get("euler_deg", [0, 0, 0]), f"{label}.euler_deg")
-
-    rotation_matrix = object_config.get("rotation_matrix")
-    if rotation_matrix is not None:
-        R = np.asarray(rotation_matrix, dtype=np.float64)
-        assert np.allclose(R.T @ R, np.eye(3), atol=1e-5), f"{label}: rotation_matrix not orthogonal"
-        assert np.isclose(np.linalg.det(R), 1.0, atol=1e-5), f"{label}: rotation_matrix det != 1"
-        quaternion = Rotation.from_matrix(R).as_quat().tolist()
-        orient_source = "rotation_matrix -> quaternion"
-    else:
-        euler_rad = [math.radians(v) for v in euler_deg]
-        quaternion = p.getQuaternionFromEuler(euler_rad)
-        orient_source = "euler_deg -> quaternion (fallback)"
+    R, quaternion, orient_source = _rotation_from_config(label, object_config)
+    object_scale = float(object_config.get("scale", 1.0))
+    if not math.isfinite(object_scale) or object_scale <= 0:
+        raise ValueError(f"{label}.scale must be positive and finite")
+    scale *= object_scale
+    rotation_matrix = R.tolist()
 
     visual_id = p.createVisualShape(
         shapeType=p.GEOM_MESH,
@@ -182,13 +206,12 @@ def _add_mesh(
     print(f"  position m         : {[round(v, 6) for v in position]}")
     print(f"  orientation src    : {orient_source}")
     print(f"  quaternion xyzw    : {[round(v, 6) for v in quaternion]}")
-    print(f"  scale              : {scale}")
+    print(f"  effective scale    : {scale}")
     print(f"  world bounds min m : {[round(v, 6) for v in world_min]}")
     print(f"  world bounds max m : {[round(v, 6) for v in world_max]}")
     print(f"  world size m       : {[round(v, 6) for v in world_dims]}")
     print(f"  world size mm      : {[round(v * 1000, 3) for v in world_dims]}")
     return body_id, world_min, world_max
-
 
 def _fit_camera(bounds: list[tuple[list[float], list[float]]], fallback_distance: float = 0.12) -> tuple[float, float, float, list[float]]:
     if not bounds:
@@ -265,8 +288,13 @@ def main() -> None:
     show_to_name = {"part1": "eye_part_1", "part2": "eye_part_2", "membrane": "membrane"}
     meshes = all_meshes if args.show == "all" else {show_to_name[args.show]: all_meshes[show_to_name[args.show]]}
 
-    config_path = args.config.expanduser().resolve() if args.config is not None else None
+    config_path = (
+        args.config.expanduser().resolve()
+        if args.config is not None
+        else Path(__file__).with_name("ilm_scene_config.json")
+    )
     config = _load_config(config_path)
+    print(f"Using scene config: {config_path}")
     objects = config["objects"]
     missing = [name for name in all_meshes if name not in objects]
     if missing:
